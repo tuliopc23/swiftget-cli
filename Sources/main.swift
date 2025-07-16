@@ -63,12 +63,23 @@ case "download":
         exit(1)
     }
     let destination: URL
-    if arguments.count >= 4 {
-        destination = URL(fileURLWithPath: arguments[3])
+    var maxRetries = 3
+    var i = 3
+    if i < arguments.count, !arguments[i].hasPrefix("--") {
+        destination = URL(fileURLWithPath: arguments[i])
+        i += 1
     } else {
         destination = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(url.lastPathComponent)
     }
-    downloadManager.addDownload(url: url, destination: destination)
+    while i < arguments.count {
+        if arguments[i] == "--retries", i + 1 < arguments.count, let n = Int(arguments[i+1]) {
+            maxRetries = n
+            i += 2
+        } else {
+            i += 1
+        }
+    }
+    downloadManager.addDownload(url: url, destination: destination, maxRetries: maxRetries)
     RunLoop.main.run()
 case "add":
     guard arguments.count >= 3, let url = parseURL(arguments[2]) else {
@@ -106,6 +117,7 @@ case "segmented":
     var destination: URL
     var segments = 4
     var mirrors: [URL] = []
+    var maxRetries = 3
     var i = 3
     if i < arguments.count, !arguments[i].hasPrefix("--") {
         destination = URL(fileURLWithPath: arguments[i])
@@ -120,11 +132,14 @@ case "segmented":
         } else if arguments[i] == "--mirror", i + 1 < arguments.count {
             mirrors = arguments[i+1].split(separator: ",").compactMap { URL(string: String($0)) }
             i += 2
+        } else if arguments[i] == "--retries", i + 1 < arguments.count, let n = Int(arguments[i+1]) {
+            maxRetries = n
+            i += 2
         } else {
             i += 1
         }
     }
-    downloadManager.addSegmentedDownload(url: url, destination: destination, segments: segments, mirrors: mirrors)
+    downloadManager.addSegmentedDownload(url: url, destination: destination, segments: segments, mirrors: mirrors, maxRetries: maxRetries)
     RunLoop.main.run()
 case "ftp":
     guard arguments.count >= 3, let url = parseURL(arguments[2]) else {

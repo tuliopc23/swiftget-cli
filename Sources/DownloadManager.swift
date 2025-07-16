@@ -8,6 +8,8 @@ class DownloadTask {
     var isPaused: Bool = false
     var isCompleted: Bool = false
     var resumeData: Data?
+    var retryCount: Int = 0
+    var maxRetries: Int = 3
     
     init(url: URL, destination: URL) {
         self.url = url
@@ -23,6 +25,8 @@ class DownloadSegment {
     var data: Data?
     var isCompleted: Bool = false
     var mirror: URL?
+    var retryCount: Int = 0
+    var maxRetries: Int = 3
     
     init(url: URL, destination: URL, range: Range<Int64>, mirror: URL? = nil) {
         self.url = url
@@ -48,8 +52,9 @@ class DownloadManager: NSObject, URLSessionDownloadDelegate, URLSessionDataDeleg
         self.maxParallelDownloads = maxParallelDownloads
     }
     
-    func addDownload(url: URL, destination: URL) {
+    func addDownload(url: URL, destination: URL, maxRetries: Int = 3) {
         let task = DownloadTask(url: url, destination: destination)
+        task.maxRetries = maxRetries
         queue.append(task)
         startNextDownloads()
     }
@@ -134,7 +139,7 @@ class DownloadManager: NSObject, URLSessionDownloadDelegate, URLSessionDataDeleg
     }
     
     // New: Segmented download
-    func addSegmentedDownload(url: URL, destination: URL, segments: Int = 4, mirrors: [URL] = []) {
+    func addSegmentedDownload(url: URL, destination: URL, segments: Int = 4, mirrors: [URL] = [], maxRetries: Int = 3) {
         // Get file size first
         var request = URLRequest(url: url)
         request.httpMethod = "HEAD"
@@ -154,6 +159,8 @@ class DownloadManager: NSObject, URLSessionDownloadDelegate, URLSessionDataDeleg
                 // Use mirrors in round-robin if provided
                 let mirror = mirrors.isEmpty ? nil : mirrors[i % mirrors.count]
                 let segment = DownloadSegment(url: mirror ?? url, destination: destination, range: range, mirror: mirror)
+                segment.retryCount = 0
+                segment.maxRetries = maxRetries
                 downloadSegments.append(segment)
             }
             self.segmentedDownloads[url] = downloadSegments
@@ -169,14 +176,25 @@ class DownloadManager: NSObject, URLSessionDownloadDelegate, URLSessionDataDeleg
             group.enter()
             var request = URLRequest(url: segment.url)
             request.addValue("bytes=\(segment.range.lowerBound)-\(segment.range.upperBound - 1)", forHTTPHeaderField: "Range")
-            let dataTask = session.dataTask(with: request) { data, response, error in
+            let dataTask = session.dataTask(with: request) { [weak self] data, response, error in
+                guard let self = self else { group.leave(); return }
                 if let data = data {
                     segment.data = data
                     segment.isCompleted = true
+                    group.leave()
                 } else {
-                    print("Segment download failed: \(error?.localizedDescription ?? "unknown error")")
+                    if segment.retryCount < segment.maxRetries {
+                        let delay = pow(2.0, Double(segment.retryCount))
+                        print("Segment failed, retrying (\(segment.retryCount+1)/\(segment.maxRetries)) in \(delay)s: \(error?.localizedDescription ?? "unknown error")")
+                        segment.retryCount += 1
+                        DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                            self.downloadSegment(segment: segment, group: group)
+                        }
+                    } else {
+                        print("Segment download failed after \(segment.maxRetries) attempts: \(error?.localizedDescription ?? "unknown error")")
+                        group.leave()
+                    }
                 }
-                group.leave()
             }
             segment.task = dataTask
             dataTask.resume()
@@ -184,6 +202,33 @@ class DownloadManager: NSObject, URLSessionDownloadDelegate, URLSessionDataDeleg
         group.notify(queue: .main) {
             self.mergeSegments(url: url, destination: destination)
         }
+    }
+
+    private func downloadSegment(segment: DownloadSegment, group: DispatchGroup) {
+        var request = URLRequest(url: segment.url)
+        request.addValue("bytes=\(segment.range.lowerBound)-\(segment.range.upperBound - 1)", forHTTPHeaderField: "Range")
+        let dataTask = session.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self else { group.leave(); return }
+            if let data = data {
+                segment.data = data
+                segment.isCompleted = true
+                group.leave()
+            } else {
+                if segment.retryCount < segment.maxRetries {
+                    let delay = pow(2.0, Double(segment.retryCount))
+                    print("Segment failed, retrying (\(segment.retryCount+1)/\(segment.maxRetries)) in \(delay)s: \(error?.localizedDescription ?? "unknown error")")
+                    segment.retryCount += 1
+                    DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                        self.downloadSegment(segment: segment, group: group)
+                    }
+                } else {
+                    print("Segment download failed after \(segment.maxRetries) attempts: \(error?.localizedDescription ?? "unknown error")")
+                    group.leave()
+                }
+            }
+        }
+        segment.task = dataTask
+        dataTask.resume()
     }
 
     private func mergeSegments(url: URL, destination: URL) {

@@ -218,3 +218,58 @@ class DownloadManager: NSObject, URLSessionDownloadDelegate, URLSessionDataDeleg
         segmentCompletionHandlers[url]?()
     }
 }
+
+#if canImport(Socket)
+import Socket
+#endif
+
+extension DownloadManager {
+    // Basic FTP download (placeholder, anonymous login)
+    func addFTPDownload(url: URL, destination: URL, username: String = "anonymous", password: String = "") {
+#if canImport(Socket)
+        guard let host = url.host, let path = url.path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
+            print("Invalid FTP URL")
+            return
+        }
+        do {
+            let socket = try Socket.create()
+            try socket.connect(to: host, port: 21)
+            func send(_ cmd: String) {
+                try? socket.write(from: cmd + "\r\n")
+            }
+            func readResponse() -> String {
+                var data = Data()
+                _ = try? socket.read(into: &data)
+                return String(data: data, encoding: .utf8) ?? ""
+            }
+            _ = readResponse() // Welcome
+            send("USER \(username)")
+            _ = readResponse()
+            send("PASS \(password)")
+            _ = readResponse()
+            send("TYPE I")
+            _ = readResponse()
+            send("PASV")
+            let pasvResp = readResponse()
+            // Parse PASV response for data port
+            let numbers = pasvResp.components(separatedBy: CharacterSet.decimalDigits.inverted).compactMap { Int($0) }
+            guard numbers.count >= 6 else { print("Failed PASV parse"); return }
+            let dataPort = numbers[4] * 256 + numbers[5]
+            let dataSocket = try Socket.create()
+            try dataSocket.connect(to: host, port: Int32(dataPort))
+            send("RETR \(path)")
+            _ = readResponse()
+            var fileData = Data()
+            _ = try? dataSocket.read(into: &fileData)
+            try fileData.write(to: destination)
+            print("FTP download complete: \(destination.path)")
+            dataSocket.close()
+            socket.close()
+        } catch {
+            print("FTP download failed: \(error)")
+        }
+#else
+        print("FTP support requires BlueSocket and a Swift toolchain.")
+#endif
+    }
+}

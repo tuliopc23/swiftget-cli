@@ -15,7 +15,24 @@ class DownloadTask {
     }
 }
 
-class DownloadManager: NSObject, URLSessionDownloadDelegate {
+class DownloadSegment {
+    let url: URL
+    let destination: URL
+    let range: Range<Int64>
+    var task: URLSessionDataTask?
+    var data: Data?
+    var isCompleted: Bool = false
+    var mirror: URL?
+    
+    init(url: URL, destination: URL, range: Range<Int64>, mirror: URL? = nil) {
+        self.url = url
+        self.destination = destination
+        self.range = range
+        self.mirror = mirror
+    }
+}
+
+class DownloadManager: NSObject, URLSessionDownloadDelegate, URLSessionDataDelegate {
     private var queue: [DownloadTask] = []
     private var activeTasks: [DownloadTask] = []
     private let maxParallelDownloads: Int
@@ -23,6 +40,9 @@ class DownloadManager: NSObject, URLSessionDownloadDelegate {
         let config = URLSessionConfiguration.default
         return URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }()
+    
+    private var segmentedDownloads: [URL: [DownloadSegment]] = [:]
+    private var segmentCompletionHandlers: [URL: (() -> Void)] = [:]
     
     init(maxParallelDownloads: Int = 2) {
         self.maxParallelDownloads = maxParallelDownloads
@@ -111,5 +131,90 @@ class DownloadManager: NSObject, URLSessionDownloadDelegate {
         for task in queue {
             print("- \(task.url.lastPathComponent) (paused: \(task.isPaused))")
         }
+    }
+    
+    // New: Segmented download
+    func addSegmentedDownload(url: URL, destination: URL, segments: Int = 4, mirrors: [URL] = []) {
+        // Get file size first
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        let headTask = session.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self, let response = response as? HTTPURLResponse,
+                  let contentLength = response.value(forHTTPHeaderField: "Content-Length"),
+                  let fileSize = Int64(contentLength) else {
+                print("Failed to get file size for segmented download.")
+                return
+            }
+            let segmentSize = fileSize / Int64(segments)
+            var downloadSegments: [DownloadSegment] = []
+            for i in 0..<segments {
+                let start = Int64(i) * segmentSize
+                let end = (i == segments - 1) ? fileSize - 1 : (start + segmentSize - 1)
+                let range = start..<(end + 1)
+                // Use mirrors in round-robin if provided
+                let mirror = mirrors.isEmpty ? nil : mirrors[i % mirrors.count]
+                let segment = DownloadSegment(url: mirror ?? url, destination: destination, range: range, mirror: mirror)
+                downloadSegments.append(segment)
+            }
+            self.segmentedDownloads[url] = downloadSegments
+            self.downloadSegments(url: url, destination: destination)
+        }
+        headTask.resume()
+    }
+
+    private func downloadSegments(url: URL, destination: URL) {
+        guard let segments = segmentedDownloads[url] else { return }
+        let group = DispatchGroup()
+        for segment in segments {
+            group.enter()
+            var request = URLRequest(url: segment.url)
+            request.addValue("bytes=\(segment.range.lowerBound)-\(segment.range.upperBound - 1)", forHTTPHeaderField: "Range")
+            let dataTask = session.dataTask(with: request) { data, response, error in
+                if let data = data {
+                    segment.data = data
+                    segment.isCompleted = true
+                } else {
+                    print("Segment download failed: \(error?.localizedDescription ?? "unknown error")")
+                }
+                group.leave()
+            }
+            segment.task = dataTask
+            dataTask.resume()
+        }
+        group.notify(queue: .main) {
+            self.mergeSegments(url: url, destination: destination)
+        }
+    }
+
+    private func mergeSegments(url: URL, destination: URL) {
+        guard let segments = segmentedDownloads[url] else { return }
+        let fileURL = destination
+        do {
+            let fileHandle = try FileHandle(forWritingTo: fileURL)
+            try fileHandle.truncate(atOffset: 0)
+            for segment in segments.sorted(by: { $0.range.lowerBound < $1.range.lowerBound }) {
+                if let data = segment.data {
+                    fileHandle.write(data)
+                }
+            }
+            try fileHandle.close()
+            print("Segmented download complete: \(fileURL.path)")
+        } catch {
+            // If file doesn't exist, create it
+            do {
+                var allData = Data()
+                for segment in segments.sorted(by: { $0.range.lowerBound < $1.range.lowerBound }) {
+                    if let data = segment.data {
+                        allData.append(data)
+                    }
+                }
+                try allData.write(to: fileURL)
+                print("Segmented download complete: \(fileURL.path)")
+            } catch {
+                print("Failed to merge segments: \(error)")
+            }
+        }
+        segmentedDownloads.removeValue(forKey: url)
+        segmentCompletionHandlers[url]?()
     }
 }

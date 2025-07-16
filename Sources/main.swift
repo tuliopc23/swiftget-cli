@@ -19,19 +19,18 @@ func printHelp() {
     print("Usage: swiftget <command> [options] <url> [destination]")
     print("")
     print("Commands:")
-    print("  download <url> [destination]   Download a file")
-    print("  add <url> [destination]        Add a file to the download queue")
-    print("  pause <url>                    Pause a download")
-    print("  resume <url>                   Resume a paused download")
-    print("  list                           List active and queued downloads")
-    print("  --version, -v                  Show version information")
-    print("  --help, -h                     Show this help message")
+    print("  download <url> [destination]         Download a file")
+    print("  add <url> [destination]              Add a file to the download queue")
+    print("  pause <url>                          Pause a download")
+    print("  resume <url>                         Resume a paused download")
+    print("  list                                 List active and queued downloads")
+    print("  segmented <url> [destination] [--segments N] [--mirror url1,url2,...]  Segmented/chunked download with optional mirrors")
+    print("  --version, -v                        Show version information")
+    print("  --help, -h                           Show this help message")
     print("")
     print("Examples:")
     print("  swiftget download https://example.com/file.zip ./file.zip")
-    print("  swiftget add https://example.com/file2.zip ./file2.zip")
-    print("  swiftget pause https://example.com/file.zip")
-    print("  swiftget resume https://example.com/file.zip")
+    print("  swiftget segmented https://example.com/file.zip ./file.zip --segments 8 --mirror https://mirror1.com/file.zip,https://mirror2.com/file.zip")
     print("  swiftget list")
 }
 
@@ -94,6 +93,34 @@ case "resume":
     RunLoop.main.run()
 case "list":
     downloadManager.listDownloads()
+case "segmented":
+    guard arguments.count >= 3, let url = parseURL(arguments[2]) else {
+        print("Error: Please provide a valid URL for segmented download")
+        exit(1)
+    }
+    var destination: URL
+    var segments = 4
+    var mirrors: [URL] = []
+    var i = 3
+    if i < arguments.count, !arguments[i].hasPrefix("--") {
+        destination = URL(fileURLWithPath: arguments[i])
+        i += 1
+    } else {
+        destination = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(url.lastPathComponent)
+    }
+    while i < arguments.count {
+        if arguments[i] == "--segments", i + 1 < arguments.count, let n = Int(arguments[i+1]) {
+            segments = n
+            i += 2
+        } else if arguments[i] == "--mirror", i + 1 < arguments.count {
+            mirrors = arguments[i+1].split(separator: ",").compactMap { URL(string: String($0)) }
+            i += 2
+        } else {
+            i += 1
+        }
+    }
+    downloadManager.addSegmentedDownload(url: url, destination: destination, segments: segments, mirrors: mirrors)
+    RunLoop.main.run()
 default:
     print("Error: Unknown command \(firstArg)")
     printHelp()

@@ -19,12 +19,12 @@ func printHelp() {
     print("Usage: swiftget <command> [options] <url> [destination]")
     print("")
     print("Commands:")
-    print("  download <url> [destination]         Download a file")
+    print("  download <url> [destination] [--retries N] [--checksum hash] [--algorithm sha1|sha256|md5]  Download a file")
     print("  add <url> [destination]              Add a file to the download queue")
     print("  pause <url>                          Pause a download")
     print("  resume <url>                         Resume a paused download")
     print("  list                                 List active and queued downloads")
-    print("  segmented <url> [destination] [--segments N] [--mirror url1,url2,...]  Segmented/chunked download with optional mirrors")
+    print("  segmented <url> [destination] [--segments N] [--mirror url1,url2,...] [--retries N] [--checksum hash] [--algorithm sha1|sha256|md5]  Segmented/chunked download with optional mirrors")
     print("  ftp <url> [destination] [--user username] [--pass password]            Download a file via FTP")
     print("  torrent <file|magnet> [destination]   Download via BitTorrent or magnet link (TODO)")
     print("  metalink <file> [destination]         Download via Metalink file (TODO)")
@@ -32,11 +32,10 @@ func printHelp() {
     print("  --help, -h                           Show this help message")
     print("")
     print("Examples:")
+    print("  swiftget download https://example.com/file.zip ./file.zip --checksum abc123 --algorithm sha256")
+    print("  swiftget segmented https://example.com/file.zip ./file.zip --segments 8 --mirror https://mirror1.com/file.zip,https://mirror2.com/file.zip --checksum abc123")
     print("  swiftget ftp ftp://example.com/file.zip ./file.zip --user myuser --pass mypass")
-    print("  swiftget segmented https://example.com/file.zip ./file.zip --segments 8 --mirror https://mirror1.com/file.zip,https://mirror2.com/file.zip")
     print("  swiftget list")
-    print("  swiftget torrent myfile.torrent ./output_dir")
-    print("  swiftget metalink myfile.metalink ./output_dir")
 }
 
 func parseURL(_ arg: String) -> URL? {
@@ -64,6 +63,8 @@ case "download":
     }
     let destination: URL
     var maxRetries = 3
+    var expectedChecksum: String?
+    var checksumAlgorithm = "sha256"
     var i = 3
     if i < arguments.count, !arguments[i].hasPrefix("--") {
         destination = URL(fileURLWithPath: arguments[i])
@@ -75,11 +76,17 @@ case "download":
         if arguments[i] == "--retries", i + 1 < arguments.count, let n = Int(arguments[i+1]) {
             maxRetries = n
             i += 2
+        } else if arguments[i] == "--checksum", i + 1 < arguments.count {
+            expectedChecksum = arguments[i+1]
+            i += 2
+        } else if arguments[i] == "--algorithm", i + 1 < arguments.count {
+            checksumAlgorithm = arguments[i+1]
+            i += 2
         } else {
             i += 1
         }
     }
-    downloadManager.addDownload(url: url, destination: destination, maxRetries: maxRetries)
+    downloadManager.addDownload(url: url, destination: destination, maxRetries: maxRetries, expectedChecksum: expectedChecksum, checksumAlgorithm: checksumAlgorithm)
     RunLoop.main.run()
 case "add":
     guard arguments.count >= 3, let url = parseURL(arguments[2]) else {
@@ -118,6 +125,8 @@ case "segmented":
     var segments = 4
     var mirrors: [URL] = []
     var maxRetries = 3
+    var expectedChecksum: String?
+    var checksumAlgorithm = "sha256"
     var i = 3
     if i < arguments.count, !arguments[i].hasPrefix("--") {
         destination = URL(fileURLWithPath: arguments[i])
@@ -135,11 +144,17 @@ case "segmented":
         } else if arguments[i] == "--retries", i + 1 < arguments.count, let n = Int(arguments[i+1]) {
             maxRetries = n
             i += 2
+        } else if arguments[i] == "--checksum", i + 1 < arguments.count {
+            expectedChecksum = arguments[i+1]
+            i += 2
+        } else if arguments[i] == "--algorithm", i + 1 < arguments.count {
+            checksumAlgorithm = arguments[i+1]
+            i += 2
         } else {
             i += 1
         }
     }
-    downloadManager.addSegmentedDownload(url: url, destination: destination, segments: segments, mirrors: mirrors, maxRetries: maxRetries)
+    downloadManager.addSegmentedDownload(url: url, destination: destination, segments: segments, mirrors: mirrors, maxRetries: maxRetries, expectedChecksum: expectedChecksum, checksumAlgorithm: checksumAlgorithm)
     RunLoop.main.run()
 case "ftp":
     guard arguments.count >= 3, let url = parseURL(arguments[2]) else {

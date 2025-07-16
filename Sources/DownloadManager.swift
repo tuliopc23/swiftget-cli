@@ -1,4 +1,5 @@
 import Foundation
+import CommonCrypto
 
 class DownloadTask {
     let url: URL
@@ -10,6 +11,8 @@ class DownloadTask {
     var resumeData: Data?
     var retryCount: Int = 0
     var maxRetries: Int = 3
+    var expectedChecksum: String?
+    var checksumAlgorithm: String = "sha256"
     
     init(url: URL, destination: URL) {
         self.url = url
@@ -27,6 +30,8 @@ class DownloadSegment {
     var mirror: URL?
     var retryCount: Int = 0
     var maxRetries: Int = 3
+    var expectedChecksum: String?
+    var checksumAlgorithm: String = "sha256"
     
     init(url: URL, destination: URL, range: Range<Int64>, mirror: URL? = nil) {
         self.url = url
@@ -52,9 +57,11 @@ class DownloadManager: NSObject, URLSessionDownloadDelegate, URLSessionDataDeleg
         self.maxParallelDownloads = maxParallelDownloads
     }
     
-    func addDownload(url: URL, destination: URL, maxRetries: Int = 3) {
+    func addDownload(url: URL, destination: URL, maxRetries: Int = 3, expectedChecksum: String? = nil, checksumAlgorithm: String = "sha256") {
         let task = DownloadTask(url: url, destination: destination)
         task.maxRetries = maxRetries
+        task.expectedChecksum = expectedChecksum
+        task.checksumAlgorithm = checksumAlgorithm
         queue.append(task)
         startNextDownloads()
     }
@@ -107,6 +114,16 @@ class DownloadManager: NSObject, URLSessionDownloadDelegate, URLSessionDataDeleg
         do {
             try FileManager.default.moveItem(at: location, to: task.destination)
             print("Downloaded \(url.lastPathComponent) to \(task.destination.path)")
+            
+            // Verify checksum if provided
+            if let expectedChecksum = task.expectedChecksum {
+                do {
+                    let fileData = try Data(contentsOf: task.destination)
+                    _ = verifyChecksum(data: fileData, expected: expectedChecksum, algorithm: task.checksumAlgorithm)
+                } catch {
+                    print("Failed to read file for checksum verification: \(error)")
+                }
+            }
         } catch {
             print("Failed to move file: \(error)")
         }
@@ -139,7 +156,7 @@ class DownloadManager: NSObject, URLSessionDownloadDelegate, URLSessionDataDeleg
     }
     
     // New: Segmented download
-    func addSegmentedDownload(url: URL, destination: URL, segments: Int = 4, mirrors: [URL] = [], maxRetries: Int = 3) {
+    func addSegmentedDownload(url: URL, destination: URL, segments: Int = 4, mirrors: [URL] = [], maxRetries: Int = 3, expectedChecksum: String? = nil, checksumAlgorithm: String = "sha256") {
         // Get file size first
         var request = URLRequest(url: url)
         request.httpMethod = "HEAD"
@@ -161,6 +178,8 @@ class DownloadManager: NSObject, URLSessionDownloadDelegate, URLSessionDataDeleg
                 let segment = DownloadSegment(url: mirror ?? url, destination: destination, range: range, mirror: mirror)
                 segment.retryCount = 0
                 segment.maxRetries = maxRetries
+                segment.expectedChecksum = expectedChecksum
+                segment.checksumAlgorithm = checksumAlgorithm
                 downloadSegments.append(segment)
             }
             self.segmentedDownloads[url] = downloadSegments
@@ -244,6 +263,16 @@ class DownloadManager: NSObject, URLSessionDownloadDelegate, URLSessionDataDeleg
             }
             try fileHandle.close()
             print("Segmented download complete: \(fileURL.path)")
+            
+            // Verify checksum if provided
+            if let expectedChecksum = segments.first?.expectedChecksum, let algorithm = segments.first?.checksumAlgorithm {
+                do {
+                    let fileData = try Data(contentsOf: fileURL)
+                    _ = verifyChecksum(data: fileData, expected: expectedChecksum, algorithm: algorithm)
+                } catch {
+                    print("Failed to read file for checksum verification: \(error)")
+                }
+            }
         } catch {
             // If file doesn't exist, create it
             do {
@@ -261,6 +290,44 @@ class DownloadManager: NSObject, URLSessionDownloadDelegate, URLSessionDataDeleg
         }
         segmentedDownloads.removeValue(forKey: url)
         segmentCompletionHandlers[url]?()
+    }
+    
+    private func calculateChecksum(data: Data, algorithm: String) -> String {
+        switch algorithm.lowercased() {
+        case "sha1":
+            var digest = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+            data.withUnsafeBytes { bytes in
+                _ = CC_SHA1(bytes.baseAddress, CC_LONG(data.count), &digest)
+            }
+            return digest.map { String(format: "%02hhx", $0) }.joined()
+        case "sha256":
+            var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+            data.withUnsafeBytes { bytes in
+                _ = CC_SHA256(bytes.baseAddress, CC_LONG(data.count), &digest)
+            }
+            return digest.map { String(format: "%02hhx", $0) }.joined()
+        case "md5":
+            var digest = [UInt8](repeating: 0, count: Int(CC_MD5_DIGEST_LENGTH))
+            data.withUnsafeBytes { bytes in
+                _ = CC_MD5(bytes.baseAddress, CC_LONG(data.count), &digest)
+            }
+            return digest.map { String(format: "%02hhx", $0) }.joined()
+        default:
+            return ""
+        }
+    }
+    
+    private func verifyChecksum(data: Data, expected: String, algorithm: String) -> Bool {
+        let calculated = calculateChecksum(data: data, algorithm: algorithm)
+        let matches = calculated.lowercased() == expected.lowercased()
+        if matches {
+            print("Checksum verification passed (\(algorithm))")
+        } else {
+            print("Checksum verification failed (\(algorithm))")
+            print("Expected: \(expected)")
+            print("Calculated: \(calculated)")
+        }
+        return matches
     }
 }
 

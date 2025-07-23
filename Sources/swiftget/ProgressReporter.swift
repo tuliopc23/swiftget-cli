@@ -68,7 +68,7 @@ class ProgressReporter {
             
             let progressBar = createProgressBar(percentage: percentage)
             
-            return String(format: "%@ %@ / %@ (%.1f%%) %@ ETA: %s [%@]",
+            return String(format: "%@ %@ / %@ (%.1f%%) %@ ETA: %@ [%@]",
                          progressBar, downloadedStr, totalStr, percentage, speedStr, eta, elapsedStr)
         } else {
             return String(format: "%@ %@ [%@]", downloadedStr, speedStr, elapsedStr)

@@ -203,16 +203,12 @@ class MultiConnectionDownloader {
 
         var bytesThisSegment: Int64 = 0
         let bufferSize = 128 * 1024
-        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
-        defer { buffer.deallocate() }
 
-        while true {
-            let count = try inputStream.read(into: buffer, maxLength: bufferSize)
-            if count == 0 { break }
-            let data = Data(bytes: buffer, count: count)
-            try fileHandle.write(contentsOf: data)
-            bytesThisSegment += Int64(count)
-            await aggregator.report(segmentBytes: Int64(count))
+        while let chunk = try await inputStream.read(upToCount: bufferSize) {
+            if chunk.isEmpty { break }
+            try fileHandle.write(contentsOf: chunk)
+            bytesThisSegment += Int64(chunk.count)
+            await aggregator.report(segmentBytes: Int64(chunk.count))
         }
     }
 

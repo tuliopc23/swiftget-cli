@@ -60,14 +60,24 @@ actor DownloadManager {
         
         logger.debug("Starting download: \(urlString)")
         
-        let downloader = SimpleFileDownloader(
-            url: url,
-            configuration: configuration,
-            session: session,
-            logger: logger
-        )
-        
-        try await downloader.download()
+        if configuration.connections > 1 {
+            logger.debug("Using multi-connection downloader with \(configuration.connections) connections")
+            let downloader = MultiConnectionDownloader(
+                url: url,
+                configuration: configuration,
+                session: session,
+                logger: logger
+            )
+            try await downloader.download()
+        } else {
+            let downloader = SimpleFileDownloader(
+                url: url,
+                configuration: configuration,
+                session: session,
+                logger: logger
+            )
+            try await downloader.download()
+        }
     }
     
     private static func parseProxyConfiguration(_ proxyString: String) -> [String: Any] {

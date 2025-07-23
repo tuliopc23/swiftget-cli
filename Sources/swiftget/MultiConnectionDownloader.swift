@@ -185,7 +185,13 @@ class MultiConnectionDownloader {
 
         // Atomic overwrite: truncate and seek to 0 before writing
         try fileHandle.truncate(atOffset: 0)
+#if compiler(>=5.3)
+        // For Swift 5.3+/macOS 10.15+/iOS 13+: seek(toOffset:) is correct and throws
         try fileHandle.seek(toOffset: 0)
+#else
+        // For older Foundation: seek(toFileOffset:) is non-throwing, so no try needed
+        fileHandle.seek(toFileOffset: 0)
+#endif
 
         defer { try? fileHandle.close() }
 

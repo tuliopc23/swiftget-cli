@@ -173,19 +173,26 @@ class MultiConnectionDownloader {
         setupRequest(&request)
         request.setValue("bytes=\(segment.start)-\(segment.end)", forHTTPHeaderField: "Range")
 
+        // Ensure .part file exists
+        if !FileManager.default.fileExists(atPath: partURL.path) {
+            FileManager.default.createFile(atPath: partURL.path, contents: nil)
+        }
+
+        guard let fileHandle = FileHandle(forWritingAtPath: partURL.path) else {
+            throw DownloadError.fileSystemError(NSError(domain: "Cannot open part file for writing", code: 0))
+        }
+
+        // Atomic overwrite: truncate and seek to 0 before writing
+        try fileHandle.truncate(atOffset: 0)
+        try fileHandle.seek(toOffset: 0)
+
+        defer { try? fileHandle.close() }
+
         // Streaming download
         let (inputStream, response) = try await session.bytes(for: request)
         guard let httpResp = response as? HTTPURLResponse, (httpResp.statusCode == 206 || httpResp.statusCode == 200) else {
             throw DownloadError.networkError(NSError(domain: "Segment status not 200/206", code: 0))
         }
-        guard let fileHandle = FileHandle(forWritingAtPath: partURL.path) ?? FileHandle(forCreatingAtPath: partURL.path) else {
-            FileManager.default.createFile(atPath: partURL.path, contents: nil)
-            guard let fh = FileHandle(forWritingAtPath: partURL.path) else { throw DownloadError.fileSystemError(NSError(domain: "Cannot create part file", code: 0)) }
-            try fh.close()
-            throw DownloadError.fileSystemError(NSError(domain: "Cannot open part file", code: 0))
-        }
-
-        defer { try? fileHandle.close() }
 
         var bytesThisSegment: Int64 = 0
         let bufferSize = 128 * 1024

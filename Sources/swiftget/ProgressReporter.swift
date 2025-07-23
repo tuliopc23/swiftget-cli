@@ -4,21 +4,29 @@ import Glibc
 #endif
 
 class ProgressReporter {
+    private let startTime: Date
     private let url: URL
     private let quiet: Bool
-    private let startTime: Date
-    private var lastUpdateTime: Date
-    private var lastBytesDownloaded: Int64 = 0
-    
-    init(url: URL, quiet: Bool) {
+
+    // When totalBytes is known up-front (e.g., multi-connection), pass it for smoother initial display
+    init(url: URL, quiet: Bool, totalBytes: Int64? = nil) {
+        self.startTime = Date()
         self.url = url
         self.quiet = quiet
-        self.startTime = Date()
-        self.lastUpdateTime = Date()
-        
         if !quiet {
-            print("Downloading: \(url.lastPathComponent)")
+            if let totalBytes = totalBytes {
+                let totalStr = formatBytes(totalBytes)
+                print("Downloading: \(url.lastPathComponent) (\(totalStr))")
+            } else {
+                print("Downloading: \(url.lastPathComponent)")
+            }
         }
+    }
+
+    func updateProgress(bytesDownloaded: Int64, totalBytes: Int64?) {
+        // Existing code...
+    }
+}
     }
     
     func updateProgress(bytesDownloaded: Int64, totalBytes: Int64?) {

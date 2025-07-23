@@ -1,5 +1,6 @@
 import Foundation
 import Logging
+import Crypto
 
 #if canImport(FoundationNetworking)
 import FoundationNetworking

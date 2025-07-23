@@ -6,7 +6,7 @@ import Logging
 struct SwiftGet: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "swiftget",
-        abstract: "A fast, modern download manager for macOS",
+        abstract: "A fast, modern download manager for macOS and Linux",
         version: "2.0.0",
         subcommands: [Download.self, Config.self],
         defaultSubcommand: Download.self

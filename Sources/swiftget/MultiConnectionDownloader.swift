@@ -1,6 +1,5 @@
 import Foundation
 import Logging
-import Crypto
 
 #if canImport(FoundationNetworking)
 import FoundationNetworking
@@ -25,8 +24,8 @@ actor ConcurrentProgressAggregator {
         progressReporter.updateProgress(bytesDownloaded: totalBytesDownloaded, totalBytes: totalBytes)
     }
 
-    func complete() {
-        progressReporter.complete()
+    nonisolated func complete() async {
+        await progressReporter.complete()
     }
 }
 
@@ -53,7 +52,7 @@ class MultiConnectionDownloader {
         let outputURL = try determineOutputURL()
         let (contentLength, acceptRanges) = try await fetchContentInfo()
         guard let contentLength = contentLength, acceptRanges == true, configuration.connections > 1 else {
-            logger.info("Falling back to single-connection download for \(url.lastPathComponent)")
+            logger.warning("Falling back to single-connection download for \(url.lastPathComponent)")
             // Fallback: Use SimpleFileDownloader
             let fallback = SimpleFileDownloader(
                 url: url,
@@ -78,11 +77,19 @@ class MultiConnectionDownloader {
             try? FileManager.default.removeItem(at: partURL)
         }
 
-        // Parallel download
+        let limiter: SpeedLimiter? = configuration.maxSpeed != nil ? SpeedLimiter(maxBytesPerSecond: configuration.maxSpeed!) : nil
+        let maxAttempts = 3
+
+        // Parallel download with retry logic
         try await withThrowingTaskGroup(of: Void.self) { group in
             for segment in segmentRanges {
                 group.addTask {
-                    try await self.downloadSegment(segment: segment, to: tmpDir, outputFilename: outputURL.lastPathComponent, aggregator: aggregator)
+                    try await self.downloadSegment(segment: segment,
+                                                   to: tmpDir,
+                                                   outputFilename: outputURL.lastPathComponent,
+                                                   aggregator: aggregator,
+                                                   limiter: limiter,
+                                                   attempts: maxAttempts)
                 }
             }
             try await group.waitForAll()
@@ -97,11 +104,11 @@ class MultiConnectionDownloader {
             try? FileManager.default.removeItem(at: partURL)
         }
 
-        aggregator.complete()
+        await aggregator.complete()
 
         // Verify checksum if provided
         if let checksumInfo = configuration.checksum {
-            try await verifyChecksum(file: outputURL, checksumInfo: checksumInfo)
+            try ChecksumVerifier.verify(file: outputURL, against: checksumInfo, logger: logger)
         }
 
         // Extract if requested
@@ -123,7 +130,7 @@ class MultiConnectionDownloader {
         var request = URLRequest(url: url)
         setupRequest(&request)
         request.httpMethod = "HEAD"
-        let (data, response) = try await session.data(for: request)
+        let (_, response) = try await session.data(for: request)
         guard let httpResp = response as? HTTPURLResponse else { return (nil, false) }
         let lengthString = httpResp.value(forHTTPHeaderField: "Content-Length")
         let acceptRanges = httpResp.value(forHTTPHeaderField: "Accept-Ranges")?.lowercased().contains("bytes") ?? false
@@ -168,7 +175,26 @@ class MultiConnectionDownloader {
         }
     }
 
-    private func downloadSegment(segment: SegmentRange, to tmpDir: URL, outputFilename: String, aggregator: ConcurrentProgressAggregator) async throws {
+    private func downloadSegment(segment: SegmentRange, to tmpDir: URL, outputFilename: String, aggregator: ConcurrentProgressAggregator, limiter: SpeedLimiter?, attempts: Int) async throws {
+        var lastError: Error?
+        for attempt in 1...attempts {
+            do {
+                try await self.downloadSegmentOnce(segment: segment, to: tmpDir, outputFilename: outputFilename, aggregator: aggregator, limiter: limiter)
+                return
+            } catch {
+                lastError = error
+                logger.warning("Retrying segment \(segment.index) (\(attempt)/\(attempts)): \(error)")
+                if attempt == attempts {
+                    throw error
+                }
+            }
+        }
+        if let lastError = lastError {
+            throw lastError
+        }
+    }
+
+    private func downloadSegmentOnce(segment: SegmentRange, to tmpDir: URL, outputFilename: String, aggregator: ConcurrentProgressAggregator, limiter: SpeedLimiter?) async throws {
         let partURL = tmpDir.appendingPathComponent("\(outputFilename).part\(segment.index)")
         var request = URLRequest(url: url)
         setupRequest(&request)
@@ -186,10 +212,8 @@ class MultiConnectionDownloader {
         // Atomic overwrite: truncate and seek to 0 before writing
         try fileHandle.truncate(atOffset: 0)
 #if compiler(>=5.3)
-        // For Swift 5.3+/macOS 10.15+/iOS 13+: seek(toOffset:) is correct and throws
         try fileHandle.seek(toOffset: 0)
 #else
-        // For older Foundation: seek(toFileOffset:) is non-throwing, so no try needed
         fileHandle.seek(toFileOffset: 0)
 #endif
 
@@ -202,12 +226,14 @@ class MultiConnectionDownloader {
         }
 
         var bytesThisSegment: Int64 = 0
-        let bufferSize = 128 * 1024
 
-        while let chunk = try await inputStream.read(upToCount: bufferSize) {
+        for try await chunk in inputStream {
             if chunk.isEmpty { break }
             try fileHandle.write(contentsOf: chunk)
             bytesThisSegment += Int64(chunk.count)
+            if let limiter = limiter {
+                await limiter.throttle(wrote: chunk.count)
+            }
             await aggregator.report(segmentBytes: Int64(chunk.count))
         }
     }
@@ -239,28 +265,6 @@ class MultiConnectionDownloader {
             }
         }
         logger.info("Assembled file: \(outputURL.lastPathComponent)")
-    }
-
-    // MARK: - Post-processing (copied from SimpleFileDownloader)
-
-    private func verifyChecksum(file: URL, checksumInfo: ChecksumInfo) async throws {
-        let data = try Data(contentsOf: file)
-        let actualHash: String
-
-        switch checksumInfo.algorithm {
-        case .md5:
-            actualHash = Insecure.MD5.hash(data: data).compactMap { String(format: "%02x", $0) }.joined()
-        case .sha1:
-            actualHash = Insecure.SHA1.hash(data: data).compactMap { String(format: "%02x", $0) }.joined()
-        case .sha256:
-            actualHash = SHA256.hash(data: data).compactMap { String(format: "%02x", $0) }.joined()
-        }
-
-        if actualHash.lowercased() != checksumInfo.hash.lowercased() {
-            throw DownloadError.checksumMismatch(expected: checksumInfo.hash, actual: actualHash)
-        }
-
-        logger.info("Checksum verified: \(checksumInfo.algorithm) = \(actualHash)")
     }
 
     private func extractFile(_ fileURL: URL) async throws {

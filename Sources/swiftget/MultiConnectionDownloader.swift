@@ -131,7 +131,7 @@ class MultiConnectionDownloader {
         return (contentLength, acceptRanges)
     }
 
-    private static func splitSegments(contentLength: Int64, numSegments: Int) -> [SegmentRange] {
+    static func splitSegments(contentLength: Int64, numSegments: Int) -> [SegmentRange] {
         let base = contentLength / Int64(numSegments)
         let rem = contentLength % Int64(numSegments)
         var segments: [SegmentRange] = []

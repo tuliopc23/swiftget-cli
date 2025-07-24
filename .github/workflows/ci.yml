@@ -1,0 +1,333 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        swift-version: ['6.1']
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Swift
+      uses: swift-actions/setup-swift@v2
+      with:
+        swift-version: ${{ matrix.swift-version }}
+    
+    - name: Cache Swift Package Manager
+      uses: actions/cache@v4
+      with:
+        path: .build
+        key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+        restore-keys: |
+          ${{ runner.os }}-spm-
+    
+    - name: Build
+      run: swift build -v
+    
+    - name: Run Unit Tests
+      run: swift test --filter SwiftGetTests
+    
+    - name: Run Checksum Tests
+      run: swift test --filter ChecksumVerifierTests
+    
+    - name: Run Speed Limiter Tests
+      run: swift test --filter SpeedLimiterTests
+    
+    - name: Run Segment Splitter Tests
+      run: swift test --filter SegmentSplitterTests
+
+  integration-tests:
+    name: Integration Tests on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        swift-version: ['6.1']
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Swift
+      uses: swift-actions/setup-swift@v2
+      with:
+        swift-version: ${{ matrix.swift-version }}
+    
+    - name: Cache Swift Package Manager
+      uses: actions/cache@v4
+      with:
+        path: .build
+        key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+        restore-keys: |
+          ${{ runner.os }}-spm-
+    
+    - name: Build
+      run: swift build -v
+    
+    - name: Run Integration Tests
+      run: swift test --filter IntegrationTests
+      timeout-minutes: 10
+    
+    - name: Run Multi-Connection Tests
+      run: swift test --filter MultiConnectionTests
+      timeout-minutes: 15
+
+  performance-tests:
+    name: Performance Tests on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        swift-version: ['6.1']
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Swift
+      uses: swift-actions/setup-swift@v2
+      with:
+        swift-version: ${{ matrix.swift-version }}
+    
+    - name: Cache Swift Package Manager
+      uses: actions/cache@v4
+      with:
+        path: .build
+        key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+        restore-keys: |
+          ${{ runner.os }}-spm-
+    
+    - name: Build Release
+      run: swift build -c release -v
+    
+    - name: Run Performance Benchmarks
+      run: swift test -c release --filter PerformanceBenchmarks
+      timeout-minutes: 20
+    
+    - name: Upload Performance Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: performance-results-${{ matrix.os }}
+        path: |
+          .build/release/
+          performance-*.log
+
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Swift
+      uses: swift-actions/setup-swift@v2
+      with:
+        swift-version: '6.1'
+    
+    - name: Check Swift Format
+      run: |
+        # Install swift-format if available
+        if command -v swift-format &> /dev/null; then
+          swift-format --version
+          find Sources Tests -name "*.swift" -exec swift-format --mode diff {} \;
+        else
+          echo "swift-format not available, skipping format check"
+        fi
+    
+    - name: Check for TODO/FIXME
+      run: |
+        if grep -r "TODO\|FIXME" Sources/ Tests/ --include="*.swift"; then
+          echo "Found TODO/FIXME comments. Please resolve before merging."
+          exit 1
+        fi
+    
+    - name: Check for Debug Print Statements
+      run: |
+        if grep -r "print(" Sources/ --include="*.swift" | grep -v "// DEBUG:"; then
+          echo "Found debug print statements. Please remove or mark with // DEBUG: comment."
+          exit 1
+        fi
+    
+    - name: Lint Package.swift
+      run: |
+        swift package dump-package > /dev/null
+        echo "Package.swift is valid"
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Run Semgrep Security Scan
+      uses: semgrep/semgrep-action@v1
+      with:
+        config: >-
+          p/security-audit
+          p/secrets
+          p/swift
+      env:
+        SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+      continue-on-error: true
+    
+    - name: Check for Hardcoded Secrets
+      run: |
+        # Check for potential hardcoded secrets
+        if grep -r -i "password\|secret\|key\|token" Sources/ --include="*.swift" | grep -v "// SAFE:"; then
+          echo "Potential hardcoded secrets found. Please review and mark safe ones with // SAFE: comment."
+          exit 1
+        fi
+
+  build-release:
+    name: Build Release Binary
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Swift
+      uses: swift-actions/setup-swift@v2
+      with:
+        swift-version: '6.1'
+    
+    - name: Build Release
+      run: swift build -c release -v
+    
+    - name: Test Release Binary
+      run: |
+        .build/release/swiftget --version
+        .build/release/swiftget --help
+    
+    - name: Package Binary
+      run: |
+        mkdir -p dist
+        cp .build/release/swiftget dist/
+        tar -czf dist/swiftget-${{ matrix.os }}.tar.gz -C dist swiftget
+    
+    - name: Upload Release Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: swiftget-${{ matrix.os }}
+        path: dist/swiftget-${{ matrix.os }}.tar.gz
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Swift
+      uses: swift-actions/setup-swift@v2
+      with:
+        swift-version: '6.1'
+    
+    - name: Generate Code Coverage
+      run: |
+        swift test --enable-code-coverage
+    
+    - name: Process Coverage Data
+      run: |
+        # Convert coverage data to lcov format if tools are available
+        if command -v llvm-cov &> /dev/null; then
+          llvm-cov export -format="lcov" .build/debug/swiftgetPackageTests.xctest > coverage.lcov
+        fi
+    
+    - name: Upload Coverage to Codecov
+      uses: codecov/codecov-action@v4
+      if: always()
+      with:
+        file: coverage.lcov
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+
+  documentation:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Swift
+      uses: swift-actions/setup-swift@v2
+      with:
+        swift-version: '6.1'
+    
+    - name: Check Documentation
+      run: |
+        # Check if README is up to date
+        if [ ! -f README.md ]; then
+          echo "README.md is missing"
+          exit 1
+        fi
+        
+        # Check if Package.swift has proper documentation
+        if ! grep -q "// swift-tools-version" Package.swift; then
+          echo "Package.swift missing swift-tools-version comment"
+          exit 1
+        fi
+    
+    - name: Validate Links in README
+      run: |
+        # Basic link validation (can be enhanced with tools like markdown-link-check)
+        if grep -o 'http[s]*://[^)]*' README.md | head -5; then
+          echo "Found links in README - manual verification recommended"
+        fi
+
+  compatibility:
+    name: Swift Version Compatibility
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        swift-version: ['6.0', '6.1']
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Swift ${{ matrix.swift-version }}
+      uses: swift-actions/setup-swift@v2
+      with:
+        swift-version: ${{ matrix.swift-version }}
+    
+    - name: Test Build Compatibility
+      run: |
+        swift --version
+        swift build -v
+    
+    - name: Test Basic Functionality
+      run: |
+        swift test --filter SwiftGetTests
+
+  notify:
+    name: Notify Results
+    runs-on: ubuntu-latest
+    needs: [test, integration-tests, performance-tests, code-quality, security-scan, build-release, coverage]
+    if: always()
+    
+    steps:
+    - name: Notify Success
+      if: ${{ needs.test.result == 'success' && needs.integration-tests.result == 'success' }}
+      run: |
+        echo "✅ All tests passed successfully!"
+        echo "🚀 SwiftGet is ready for deployment"
+    
+    - name: Notify Failure
+      if: ${{ needs.test.result == 'failure' || needs.integration-tests.result == 'failure' }}
+      run: |
+        echo "❌ Some tests failed"
+        echo "🔧 Please check the failed jobs and fix issues"
+        exit 1

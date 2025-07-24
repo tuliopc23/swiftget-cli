@@ -1,5 +1,6 @@
 import XCTest
 import Logging
+import CryptoKit
 @testable import swiftget
 
 final class ChecksumVerifierTests: XCTestCase {

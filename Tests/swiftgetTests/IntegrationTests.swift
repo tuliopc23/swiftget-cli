@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
 import Logging
+import CryptoKit
 @testable import swiftget
 
 final class IntegrationTests: XCTestCase {

@@ -40,12 +40,25 @@ class MultiConnectionDownloader {
     private let configuration: DownloadConfiguration
     private let session: URLSession
     private let logger: Logger
+    
+    // Advanced optimization components
+    private let adaptiveSegmentSizer: AdaptiveSegmentSizer
+    private let connectionPoolManager: ConnectionPoolManager
+    private let bandwidthAllocator: BandwidthAllocator
 
     init(url: URL, configuration: DownloadConfiguration, session: URLSession, logger: Logger) {
         self.url = url
         self.configuration = configuration
         self.session = session
         self.logger = logger
+        
+        // Initialize optimization components
+        self.adaptiveSegmentSizer = AdaptiveSegmentSizer(logger: logger)
+        self.connectionPoolManager = ConnectionPoolManager(logger: logger)
+        self.bandwidthAllocator = BandwidthAllocator(
+            totalBandwidthLimit: configuration.maxSpeed,
+            logger: logger
+        )
     }
 
     func download() async throws {
@@ -64,7 +77,13 @@ class MultiConnectionDownloader {
             return
         }
 
-        let segmentRanges = MultiConnectionDownloader.splitSegments(contentLength: contentLength, numSegments: configuration.connections)
+        // Use adaptive segment sizing for optimal performance
+        let serverResponseTime = await measureServerResponseTime()
+        let segmentRanges = await adaptiveSegmentSizer.calculateOptimalSegments(
+            contentLength: contentLength,
+            numConnections: configuration.connections,
+            serverResponseTime: serverResponseTime
+        )
         let progressReporter = ProgressReporter(url: url, quiet: configuration.quiet, totalBytes: contentLength)
         let aggregator = ConcurrentProgressAggregator(totalBytes: contentLength, progressReporter: progressReporter)
 
@@ -77,7 +96,6 @@ class MultiConnectionDownloader {
             try? FileManager.default.removeItem(at: partURL)
         }
 
-        let limiter: SpeedLimiter? = configuration.maxSpeed != nil ? SpeedLimiter(maxBytesPerSecond: configuration.maxSpeed!) : nil
         let maxAttempts = 3
 
         // Parallel download with retry logic
@@ -88,7 +106,6 @@ class MultiConnectionDownloader {
                                                    to: tmpDir,
                                                    outputFilename: outputURL.lastPathComponent,
                                                    aggregator: aggregator,
-                                                   limiter: limiter,
                                                    attempts: maxAttempts)
                 }
             }
@@ -137,6 +154,27 @@ class MultiConnectionDownloader {
         let contentLength = lengthString.flatMap { Int64($0) }
         return (contentLength, acceptRanges)
     }
+    
+    /// Measure server response time for optimization decisions
+    private func measureServerResponseTime() async -> TimeInterval {
+        let startTime = CFAbsoluteTimeGetCurrent()
+        
+        do {
+            var request = URLRequest(url: url)
+            setupRequest(&request)
+            request.httpMethod = "HEAD"
+            let (_, response) = try await session.data(for: request)
+            
+            let endTime = CFAbsoluteTimeGetCurrent()
+            let responseTime = endTime - startTime
+            
+            logger.debug("Server response time: \(String(format: "%.3f", responseTime))s")
+            return responseTime
+        } catch {
+            logger.warning("Failed to measure server response time: \(error)")
+            return 0.1 // Default to 100ms if measurement fails
+        }
+    }
 
     static func splitSegments(contentLength: Int64, numSegments: Int) -> [SegmentRange] {
         let base = contentLength / Int64(numSegments)
@@ -175,12 +213,43 @@ class MultiConnectionDownloader {
         }
     }
 
-    private func downloadSegment(segment: SegmentRange, to tmpDir: URL, outputFilename: String, aggregator: ConcurrentProgressAggregator, limiter: SpeedLimiter?, attempts: Int) async throws {
+    private func downloadSegment(segment: SegmentRange, to tmpDir: URL, outputFilename: String, aggregator: ConcurrentProgressAggregator, attempts: Int) async throws {
+        // Register segment with bandwidth allocator
+        await bandwidthAllocator.registerSegment(segment.index, estimatedSize: segment.end - segment.start + 1)
+        
+        // Get connection pool for this host
+        let pool = await connectionPoolManager.getPool(for: url)
+        
+        // Create bandwidth-aware limiter
+        let limiter = BandwidthAwareSpeedLimiter(allocator: bandwidthAllocator, segmentIndex: segment.index)
+        
         var lastError: Error?
         for attempt in 1...attempts {
             do {
-                try await self.downloadSegmentOnce(segment: segment, to: tmpDir, outputFilename: outputFilename, aggregator: aggregator, limiter: limiter)
-                return
+                // Get connection from pool
+                let session = await pool.getConnection(for: url)
+                
+                do {
+                    try await self.downloadSegmentOnce(
+                        segment: segment,
+                        to: tmpDir,
+                        outputFilename: outputFilename,
+                        aggregator: aggregator,
+                        limiter: limiter,
+                        session: session
+                    )
+                    
+                    // Return connection to pool on success
+                    await pool.returnConnection(session)
+                    
+                    // Mark segment as complete in bandwidth allocator
+                    await bandwidthAllocator.completeSegment(segment.index)
+                    return
+                } catch {
+                    // Return connection to pool on error
+                    await pool.returnConnection(session)
+                    throw error
+                }
             } catch {
                 lastError = error
                 logger.warning("Retrying segment \(segment.index) (\(attempt)/\(attempts)): \(error)")
@@ -194,11 +263,22 @@ class MultiConnectionDownloader {
         }
     }
 
-    private func downloadSegmentOnce(segment: SegmentRange, to tmpDir: URL, outputFilename: String, aggregator: ConcurrentProgressAggregator, limiter: SpeedLimiter?) async throws {
+    private func downloadSegmentOnce(
+        segment: SegmentRange,
+        to tmpDir: URL,
+        outputFilename: String,
+        aggregator: ConcurrentProgressAggregator,
+        limiter: BandwidthAwareSpeedLimiter,
+        session: URLSession
+    ) async throws {
         let partURL = tmpDir.appendingPathComponent("\(outputFilename).part\(segment.index)")
         var request = URLRequest(url: url)
         setupRequest(&request)
         request.setValue("bytes=\(segment.start)-\(segment.end)", forHTTPHeaderField: "Range")
+
+        // Add performance optimization headers
+        request.setValue("gzip, deflate", forHTTPHeaderField: "Accept-Encoding")
+        request.setValue("keep-alive", forHTTPHeaderField: "Connection")
 
         // Ensure .part file exists
         if !FileManager.default.fileExists(atPath: partURL.path) {
@@ -219,23 +299,39 @@ class MultiConnectionDownloader {
 
         defer { try? fileHandle.close() }
 
-        // Streaming download
+        // Streaming download with optimized session
         let (inputStream, response) = try await session.bytes(for: request)
         guard let httpResp = response as? HTTPURLResponse, (httpResp.statusCode == 206 || httpResp.statusCode == 200) else {
             throw DownloadError.networkError(NSError(domain: "Segment status not 200/206", code: 0))
         }
 
         var bytesThisSegment: Int64 = 0
+        let startTime = CFAbsoluteTimeGetCurrent()
 
         for try await chunk in inputStream {
             if chunk.isEmpty { break }
             try fileHandle.write(contentsOf: chunk)
             bytesThisSegment += Int64(chunk.count)
-            if let limiter = limiter {
-                await limiter.throttle(wrote: chunk.count)
-            }
+            
+            // Use bandwidth-aware limiter
+            await limiter.throttle(wrote: chunk.count)
+            
+            // Report progress
             await aggregator.report(segmentBytes: Int64(chunk.count))
         }
+
+        // Calculate and log segment performance
+        let endTime = CFAbsoluteTimeGetCurrent()
+        let downloadTime = endTime - startTime
+        let throughputMBps = Double(bytesThisSegment) / downloadTime / (1024 * 1024)
+        logger.debug("Segment \(segment.index) completed: \(String(format: "%.2f", throughputMBps)) MB/s")
+        
+        // Record performance for adaptive sizing
+        await adaptiveSegmentSizer.recordSegmentPerformance(
+            segmentIndex: segment.index,
+            downloadTime: downloadTime,
+            bytesDownloaded: bytesThisSegment
+        )
     }
 
     private func assembleParts(segmentRanges: [SegmentRange], tmpDir: URL, outputURL: URL) throws {
@@ -265,6 +361,37 @@ class MultiConnectionDownloader {
             }
         }
         logger.info("Assembled file: \(outputURL.lastPathComponent)")
+    }
+    
+    /// Clean up resources and perform maintenance
+    func cleanup() async {
+        // Clean up expired connections
+        await connectionPoolManager.cleanupAllPools()
+        
+        // Clean up old bandwidth allocation data
+        await bandwidthAllocator.cleanup()
+        
+        // Clean up old performance data
+        await adaptiveSegmentSizer.cleanupOldData()
+    }
+    
+    /// Shutdown and release all resources
+    func shutdown() async {
+        // Shutdown connection pools
+        await connectionPoolManager.shutdown()
+        
+        // Log final performance stats
+        let stats = await bandwidthAllocator.getStats()
+        logger.info("Final bandwidth stats:\n\(stats.formattedStats)")
+        
+        let perfStats = await adaptiveSegmentSizer.getPerformanceStats()
+        logger.info("Final performance stats:\n\(perfStats.formattedSummary)")
+    }
+    
+    deinit {
+        Task {
+            await shutdown()
+        }
     }
 
     private func extractFile(_ fileURL: URL) async throws {

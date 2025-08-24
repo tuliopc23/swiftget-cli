@@ -8,34 +8,7 @@ import FoundationNetworking
 import AppKit
 #endif
 
-// Aggregates progress from all segments and forwards to ProgressReporter
-actor ConcurrentProgressAggregator {
-    private var totalBytesDownloaded: Int64 = 0
-    private let totalBytes: Int64
-    private let progressReporter: ProgressReporter
-
-    init(totalBytes: Int64, progressReporter: ProgressReporter) {
-        self.totalBytes = totalBytes
-        self.progressReporter = progressReporter
-    }
-
-    func report(segmentBytes: Int64) {
-        totalBytesDownloaded += segmentBytes
-        progressReporter.updateProgress(bytesDownloaded: totalBytesDownloaded, totalBytes: totalBytes)
-    }
-
-    nonisolated func complete() async {
-        await progressReporter.complete()
-    }
-}
-
-struct SegmentRange {
-    let index: Int
-    let start: Int64
-    let end: Int64 // inclusive
-}
-
-class MultiConnectionDownloader {
+class MultiConnectionDownloader: @unchecked Sendable {
     private let url: URL
     private let configuration: DownloadConfiguration
     private let session: URLSession
@@ -50,9 +23,29 @@ class MultiConnectionDownloader {
 
     func download() async throws {
         let outputURL = try determineOutputURL()
-        let (contentLength, acceptRanges) = try await fetchContentInfo()
-        guard let contentLength = contentLength, acceptRanges == true, configuration.connections > 1 else {
-            logger.warning("Falling back to single-connection download for \(url.lastPathComponent)")
+        let segmentationStrategy = SegmentationStrategy(logger: logger)
+        
+        // Analyze server capabilities first
+        let serverCapabilities = try await segmentationStrategy.analyzeServerCapabilities(
+            url: url,
+            session: session,
+            headers: configuration.headers
+        )
+        
+        // Get content length from capabilities or fallback to HEAD request
+        let contentLength: Int64
+        if let serverContentLength = serverCapabilities.contentLength {
+            contentLength = serverContentLength
+        } else {
+            let (fallbackLength, _) = try await fetchContentInfo()
+            guard let fallbackLength = fallbackLength else {
+                throw DownloadError.connectionFailed(underlying: NSError(domain: "Cannot determine content length", code: -1))
+            }
+            contentLength = fallbackLength
+        }
+        
+        guard contentLength > 0 else {
+            logger.warning("Cannot determine content length for \(url.lastPathComponent)")
             // Fallback: Use SimpleFileDownloader
             let fallback = SimpleFileDownloader(
                 url: url,
@@ -63,10 +56,39 @@ class MultiConnectionDownloader {
             try await fallback.download()
             return
         }
+        
+        // Calculate optimal segmentation using intelligent strategy
+        let segmentRanges = segmentationStrategy.calculateOptimalSegmentation(
+            contentLength: contentLength,
+            requestedConnections: configuration.connections,
+            serverCapabilities: serverCapabilities
+        )
+        
+        // If only one segment recommended, fall back to simple downloader
+        guard segmentRanges.count > 1 else {
+            logger.info("Single segment recommended for \(url.lastPathComponent), using SimpleFileDownloader")
+            let fallback = SimpleFileDownloader(
+                url: url,
+                configuration: configuration,
+                session: session,
+                logger: logger
+            )
+            try await fallback.download()
+            return
+        }
 
-        let segmentRanges = MultiConnectionDownloader.splitSegments(contentLength: contentLength, numSegments: configuration.connections)
-        let progressReporter = ProgressReporter(url: url, quiet: configuration.quiet, totalBytes: contentLength)
-        let aggregator = ConcurrentProgressAggregator(totalBytes: contentLength, progressReporter: progressReporter)
+        let progressReporter = ProgressReporter(
+            url: url, 
+            quiet: configuration.quiet, 
+            totalBytes: contentLength,
+            config: .multiConnection
+        )
+        let aggregator = ConcurrentProgressAggregator(
+            totalBytes: contentLength,
+            progressReporter: progressReporter,
+            segmentRanges: segmentRanges,
+            logger: logger
+        )
 
         let tmpDir = outputURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
@@ -77,31 +99,98 @@ class MultiConnectionDownloader {
             try? FileManager.default.removeItem(at: partURL)
         }
 
-        let limiter: SpeedLimiter? = configuration.maxSpeed != nil ? SpeedLimiter(maxBytesPerSecond: configuration.maxSpeed!) : nil
-        let maxAttempts = 3
+        let limiter: SpeedLimiter? = configuration.maxSpeed != nil ? SpeedLimiter(maxBytesPerSecond: Int64(configuration.maxSpeed!)) : nil
+        
+        // Initialize error recovery
+        let errorRecovery = SegmentErrorRecovery(logger: logger)
+        await errorRecovery.initializeSegments(segmentRanges)
+        
+        // Track active segments for redistribution
+        var activeSegmentRanges = segmentRanges
 
-        // Parallel download with retry logic
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            for segment in segmentRanges {
-                group.addTask {
-                    try await self.downloadSegment(segment: segment,
-                                                   to: tmpDir,
-                                                   outputFilename: outputURL.lastPathComponent,
-                                                   aggregator: aggregator,
-                                                   limiter: limiter,
-                                                   attempts: maxAttempts)
+        // Enhanced parallel download with error recovery
+        var downloadCompleted = false
+        var fallbackToSingleConnection = false
+        
+        while !downloadCompleted && !fallbackToSingleConnection {
+            do {
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    for segment in activeSegmentRanges {
+                        group.addTask {
+                            try await self.downloadSegmentWithRecovery(
+                                segment: segment,
+                                to: tmpDir,
+                                outputFilename: outputURL.lastPathComponent,
+                                aggregator: aggregator,
+                                limiter: limiter,
+                                errorRecovery: errorRecovery
+                            )
+                        }
+                    }
+                    try await group.waitForAll()
+                }
+                downloadCompleted = true
+            } catch let segmentError as SegmentError {
+                let strategy = await errorRecovery.handleSegmentFailure(segmentError)
+                
+                switch strategy {
+                case .retry:
+                    logger.info("Retrying failed segments")
+                    // Continue the while loop to retry
+                    
+                case .redistribute:
+                    logger.info("Redistributing segment \(segmentError.segmentIndex)")
+                    let activeIndices = activeSegmentRanges.map { $0.index }
+                    let newSegments = await errorRecovery.redistributeSegment(
+                        segmentError.segmentIndex,
+                        amongSegments: activeIndices
+                    )
+                    
+                    // Remove failed segment and add redistributed segments
+                    activeSegmentRanges.removeAll { $0.index == segmentError.segmentIndex }
+                    activeSegmentRanges.append(contentsOf: newSegments)
+                    
+                case .fallback:
+                    logger.warning("Falling back to single-connection download")
+                    fallbackToSingleConnection = true
+                    
+                case .abort:
+                    logger.error("Aborting download due to excessive failures")
+                    let stats = await errorRecovery.getRecoveryStatistics()
+                    throw DownloadError.connectionFailed(underlying: NSError(
+                        domain: "Download aborted after \(stats.totalRetries) retries and \(stats.totalRedistributions) redistributions",
+                        code: -1
+                    ))
                 }
             }
-            try await group.waitForAll()
+        }
+        
+        // Handle fallback to single connection if needed
+        if fallbackToSingleConnection {
+            logger.info("Switching to single-connection fallback")
+            let fallback = SimpleFileDownloader(
+                url: url,
+                configuration: configuration,
+                session: session,
+                logger: logger
+            )
+            try await fallback.download()
+            return
         }
 
         // Concatenate part files
-        try assembleParts(segmentRanges: segmentRanges, tmpDir: tmpDir, outputURL: outputURL)
+        try assembleParts(segmentRanges: activeSegmentRanges, tmpDir: tmpDir, outputURL: outputURL)
 
         // Clean up part files
-        for seg in segmentRanges {
+        for seg in activeSegmentRanges {
             let partURL = tmpDir.appendingPathComponent("\(outputURL.lastPathComponent).part\(seg.index)")
             try? FileManager.default.removeItem(at: partURL)
+        }
+        
+        // Log recovery statistics
+        let recoveryStats = await errorRecovery.getRecoveryStatistics()
+        if recoveryStats.totalRetries > 0 || recoveryStats.totalRedistributions > 0 {
+            logger.info("Download completed with \(recoveryStats.totalRetries) retries and \(recoveryStats.totalRedistributions) redistributions")
         }
 
         await aggregator.complete()
@@ -138,20 +227,15 @@ class MultiConnectionDownloader {
         return (contentLength, acceptRanges)
     }
 
+    // Legacy method kept for backward compatibility, but now delegates to SegmentationStrategy
     static func splitSegments(contentLength: Int64, numSegments: Int) -> [SegmentRange] {
-        let base = contentLength / Int64(numSegments)
-        let rem = contentLength % Int64(numSegments)
-        var segments: [SegmentRange] = []
-        var start: Int64 = 0
-
-        for i in 0..<numSegments {
-            let extra = (i < rem) ? 1 : 0
-            let segLen = base + Int64(extra)
-            let end = start + segLen - 1
-            segments.append(SegmentRange(index: i, start: start, end: end))
-            start = end + 1
-        }
-        return segments
+        let strategy = SegmentationStrategy(logger: Logger(label: "legacy-segmentation"))
+        let serverCapabilities = ServerCapabilities(acceptsRangeRequests: true, contentLength: contentLength)
+        return strategy.calculateOptimalSegmentation(
+            contentLength: contentLength,
+            requestedConnections: numSegments,
+            serverCapabilities: serverCapabilities
+        )
     }
 
     private func determineOutputURL() throws -> URL {
@@ -175,22 +259,37 @@ class MultiConnectionDownloader {
         }
     }
 
-    private func downloadSegment(segment: SegmentRange, to tmpDir: URL, outputFilename: String, aggregator: ConcurrentProgressAggregator, limiter: SpeedLimiter?, attempts: Int) async throws {
-        var lastError: Error?
-        for attempt in 1...attempts {
-            do {
-                try await self.downloadSegmentOnce(segment: segment, to: tmpDir, outputFilename: outputFilename, aggregator: aggregator, limiter: limiter)
-                return
-            } catch {
-                lastError = error
-                logger.warning("Retrying segment \(segment.index) (\(attempt)/\(attempts)): \(error)")
-                if attempt == attempts {
-                    throw error
-                }
-            }
-        }
-        if let lastError = lastError {
-            throw lastError
+    private func downloadSegmentWithRecovery(
+        segment: SegmentRange,
+        to tmpDir: URL,
+        outputFilename: String,
+        aggregator: ConcurrentProgressAggregator,
+        limiter: SpeedLimiter?,
+        errorRecovery: SegmentErrorRecovery
+    ) async throws {
+        do {
+            try await downloadSegmentOnce(
+                segment: segment,
+                to: tmpDir,
+                outputFilename: outputFilename,
+                aggregator: aggregator,
+                limiter: limiter
+            )
+            
+            // Mark segment as complete in aggregator
+            await aggregator.markSegmentComplete(segmentIndex: segment.index)
+            
+        } catch {
+            // Classify the error and create SegmentError
+            let segmentError = await errorRecovery.classifyError(
+                error,
+                segmentIndex: segment.index,
+                attemptNumber: 1,
+                bytesTransferred: 0 // TODO: Track actual bytes transferred
+            )
+            
+            // Re-throw as SegmentError for handling by the recovery system
+            throw segmentError
         }
     }
 
@@ -222,19 +321,20 @@ class MultiConnectionDownloader {
         // Streaming download
         let (inputStream, response) = try await session.bytes(for: request)
         guard let httpResp = response as? HTTPURLResponse, (httpResp.statusCode == 206 || httpResp.statusCode == 200) else {
-            throw DownloadError.networkError(NSError(domain: "Segment status not 200/206", code: 0))
+            throw DownloadError.connectionFailed(underlying: NSError(domain: "Segment status not 200/206", code: 0))
         }
 
         var bytesThisSegment: Int64 = 0
 
         for try await chunk in inputStream {
-            if chunk.isEmpty { break }
-            try fileHandle.write(contentsOf: chunk)
-            bytesThisSegment += Int64(chunk.count)
+            let data = Data([chunk])
+            guard !data.isEmpty else { break }
+            try fileHandle.write(contentsOf: data)
+            bytesThisSegment += Int64(data.count)
             if let limiter = limiter {
-                await limiter.throttle(wrote: chunk.count)
+                await limiter.throttle(wrote: data.count)
             }
-            await aggregator.report(segmentBytes: Int64(chunk.count))
+            await aggregator.reportSegmentProgress(segmentIndex: segment.index, additionalBytes: Int64(data.count))
         }
     }
 
@@ -264,7 +364,7 @@ class MultiConnectionDownloader {
                 }
             }
         }
-        logger.info("Assembled file: \(outputURL.lastPathComponent)")
+        logger.info("Assembled file: \(outputURL.lastPathComponent) from \(segmentRanges.count) segments")
     }
 
     private func extractFile(_ fileURL: URL) async throws {

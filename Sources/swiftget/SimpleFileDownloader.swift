@@ -57,16 +57,17 @@ class SimpleFileDownloader {
         }
         defer { try? fileHandle.close() }
 
-        let limiter: SpeedLimiter? = configuration.maxSpeed != nil ? SpeedLimiter(maxBytesPerSecond: configuration.maxSpeed!) : nil
+        let limiter: SpeedLimiter? = configuration.maxSpeed != nil ? SpeedLimiter(maxBytesPerSecond: Int64(configuration.maxSpeed!)) : nil
 
         var totalBytes: Int64 = 0
         let bufferSize = 128 * 1024
 
         for try await chunk in inputStream {
-            try fileHandle.write(contentsOf: chunk)
-            totalBytes += Int64(chunk.count)
+            let data = Data([chunk])
+            try fileHandle.write(contentsOf: data)
+            totalBytes += Int64(data.count)
             if let limiter = limiter {
-                await limiter.throttle(wrote: chunk.count)
+                await limiter.throttle(wrote: data.count)
             }
             progressReporter?.updateProgress(bytesDownloaded: totalBytes, totalBytes: nil)
         }
@@ -119,15 +120,16 @@ class SimpleFileDownloader {
         }
         try fileHandle.seekToEnd()
 
-        let limiter: SpeedLimiter? = configuration.maxSpeed != nil ? SpeedLimiter(maxBytesPerSecond: configuration.maxSpeed!) : nil
+        let limiter: SpeedLimiter? = configuration.maxSpeed != nil ? SpeedLimiter(maxBytesPerSecond: Int64(configuration.maxSpeed!)) : nil
 
         var totalBytes = existingSize
 
         for try await chunk in inputStream {
-            try fileHandle.write(contentsOf: chunk)
-            totalBytes += Int64(chunk.count)
+            let data = Data([chunk])
+            try fileHandle.write(contentsOf: data)
+            totalBytes += Int64(data.count)
             if let limiter = limiter {
-                await limiter.throttle(wrote: chunk.count)
+                await limiter.throttle(wrote: data.count)
             }
             progressReporter?.updateProgress(bytesDownloaded: totalBytes, totalBytes: nil)
         }

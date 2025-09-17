@@ -429,7 +429,7 @@ struct RetryContext {
     let isMultiConnection: Bool
     let isResume: Bool
     let hasSucceededBefore: Bool
-    let networkQuality: NetworkQuality
+    let networkQuality: ErrorNetworkQuality
     let systemMemoryPressure: MemoryPressure
     let systemCPUUsage: Double
     let activeConcurrentDownloads: Int
@@ -437,7 +437,7 @@ struct RetryContext {
     
     init(currentAttempt: Int = 1, totalElapsedTime: TimeInterval = 0,
          isMultiConnection: Bool = false, isResume: Bool = false,
-         hasSucceededBefore: Bool = false, networkQuality: NetworkQuality = .unknown,
+         hasSucceededBefore: Bool = false, networkQuality: ErrorNetworkQuality = .unknown,
          systemMemoryPressure: MemoryPressure = .normal, systemCPUUsage: Double = 0.0,
          activeConcurrentDownloads: Int = 1, totalFileSize: Int64? = nil) {
         self.currentAttempt = currentAttempt
@@ -453,8 +453,8 @@ struct RetryContext {
     }
 }
 
-/// Network quality enumeration
-enum NetworkQuality {
+/// Error-specific network quality enumeration
+enum ErrorNetworkQuality {
     case excellent
     case good
     case fair

@@ -100,7 +100,7 @@ actor DownloadManager {
     }
     
     /// Generic retry wrapper for any async operation
-    private func withRetryLogic<T>(
+    private func withRetryLogic<T: Sendable>(
         operation: @escaping () async throws -> T,
         context: String
     ) async throws -> T {

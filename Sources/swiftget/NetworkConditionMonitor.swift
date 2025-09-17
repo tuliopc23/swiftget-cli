@@ -1,6 +1,12 @@
 import Foundation
-import Network
 import Logging
+
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+#if canImport(Network)
+import Network
+#endif
 
 /// Network condition monitor that tracks real-time network performance metrics
 /// Uses NWPathMonitor and active probing to assess network quality and performance
@@ -63,8 +69,10 @@ actor NetworkConditionMonitor {
     private let session: URLSession
     
     // Network path monitoring
+    #if canImport(Network)
     private let pathMonitor: NWPathMonitor
     private var currentPath: NWPath?
+    #endif
     private var monitoringQueue: DispatchQueue
     
     // Performance metrics
@@ -93,7 +101,9 @@ actor NetworkConditionMonitor {
         self.session = URLSession(configuration: sessionConfig)
         
         // Setup network path monitoring
+        #if canImport(Network)
         self.pathMonitor = NWPathMonitor()
+        #endif
         self.monitoringQueue = DispatchQueue(label: "network-monitor", qos: .utility)
         
         // Initialize with unknown conditions
@@ -108,13 +118,18 @@ actor NetworkConditionMonitor {
             lastUpdated: Date()
         )
         
-        setupPathMonitoring()
+        // Setup path monitoring asynchronously
+        Task {
+            await setupPathMonitoring()
+        }
         
         logger.info("NetworkConditionMonitor initialized with configuration: \(configuration.probingInterval)s interval")
     }
     
     deinit {
-        stopMonitoring()
+        Task {
+            await stopMonitoring()
+        }
     }
     
     // MARK: - Public Interface
@@ -124,7 +139,9 @@ actor NetworkConditionMonitor {
         guard !isMonitoring else { return }
         
         isMonitoring = true
+        #if canImport(Network)
         pathMonitor.start(queue: monitoringQueue)
+        #endif
         
         if configuration.enableContinuousMonitoring {
             monitoringTask = Task {
@@ -143,7 +160,9 @@ actor NetworkConditionMonitor {
         guard isMonitoring else { return }
         
         isMonitoring = false
+        #if canImport(Network)
         pathMonitor.cancel()
+        #endif
         monitoringTask?.cancel()
         monitoringTask = nil
         
@@ -211,13 +230,16 @@ actor NetworkConditionMonitor {
     // MARK: - Private Methods
     
     private func setupPathMonitoring() {
+        #if canImport(Network)
         pathMonitor.pathUpdateHandler = { [weak self] path in
             Task {
                 await self?.handlePathUpdate(path)
             }
         }
+        #endif
     }
     
+    #if canImport(Network)
     private func handlePathUpdate(_ path: NWPath) async {
         currentPath = path
         
@@ -260,6 +282,7 @@ actor NetworkConditionMonitor {
         // Probe on status changes or interface type changes
         return path.status == .satisfied || path.status == .unsatisfied
     }
+    #endif
     
     private func performContinuousMonitoring() async {
         while isMonitoring && !Task.isCancelled {
@@ -277,10 +300,12 @@ actor NetworkConditionMonitor {
     }
     
     private func performNetworkProbe() async {
+        #if canImport(Network)
         guard let path = currentPath, path.status == .satisfied else {
             await updateConditions(currentConditions.withQuality(.poor))
             return
         }
+        #endif
         
         lastProbeTime = Date()
         logger.debug("Performing network probe")

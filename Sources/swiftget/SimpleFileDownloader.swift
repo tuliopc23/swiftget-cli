@@ -43,8 +43,8 @@ class SimpleFileDownloader {
             progressReporter = ProgressReporter(url: url, quiet: configuration.quiet)
         }
 
-        // Streaming download to avoid memory blow-up
-        let (inputStream, response) = try await session.bytes(for: request)
+        // Use traditional data task for cross-platform compatibility
+        let (data, response) = try await session.data(for: request)
 
         // Create output directory if needed
         let outputDir = outputURL.deletingLastPathComponent()
@@ -59,18 +59,14 @@ class SimpleFileDownloader {
 
         let limiter: SpeedLimiter? = configuration.maxSpeed != nil ? SpeedLimiter(maxBytesPerSecond: Int64(configuration.maxSpeed!)) : nil
 
-        var totalBytes: Int64 = 0
-        let bufferSize = 128 * 1024
-
-        for try await chunk in inputStream {
-            let data = Data([chunk])
-            try fileHandle.write(contentsOf: data)
-            totalBytes += Int64(data.count)
-            if let limiter = limiter {
-                await limiter.throttle(wrote: data.count)
-            }
-            progressReporter?.updateProgress(bytesDownloaded: totalBytes, totalBytes: nil)
+        // Write the downloaded data to file
+        try fileHandle.write(contentsOf: data)
+        let totalBytes = Int64(data.count)
+        
+        if let limiter = limiter {
+            await limiter.throttle(wrote: data.count)
         }
+        progressReporter?.updateProgress(bytesDownloaded: totalBytes, totalBytes: totalBytes)
 
         logger.info("Downloaded: \(outputURL.path)")
 
@@ -112,7 +108,7 @@ class SimpleFileDownloader {
             progressReporter?.updateProgress(bytesDownloaded: existingSize, totalBytes: nil)
         }
 
-        let (inputStream, response) = try await session.bytes(for: request)
+        let (data, response) = try await session.data(for: request)
 
         // Open file for appending
         guard let fileHandle = FileHandle(forWritingAtPath: outputURL.path) else {
@@ -122,17 +118,14 @@ class SimpleFileDownloader {
 
         let limiter: SpeedLimiter? = configuration.maxSpeed != nil ? SpeedLimiter(maxBytesPerSecond: Int64(configuration.maxSpeed!)) : nil
 
-        var totalBytes = existingSize
+        let totalBytes = existingSize + Int64(data.count)
 
-        for try await chunk in inputStream {
-            let data = Data([chunk])
-            try fileHandle.write(contentsOf: data)
-            totalBytes += Int64(data.count)
-            if let limiter = limiter {
-                await limiter.throttle(wrote: data.count)
-            }
-            progressReporter?.updateProgress(bytesDownloaded: totalBytes, totalBytes: nil)
+        // Write the new data to file
+        try fileHandle.write(contentsOf: data)
+        if let limiter = limiter {
+            await limiter.throttle(wrote: data.count)
         }
+        progressReporter?.updateProgress(bytesDownloaded: totalBytes, totalBytes: totalBytes)
 
         logger.info("Resumed download completed: \(outputURL.path)")
 

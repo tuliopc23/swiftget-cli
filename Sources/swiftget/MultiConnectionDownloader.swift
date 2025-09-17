@@ -318,24 +318,21 @@ class MultiConnectionDownloader: @unchecked Sendable {
 
         defer { try? fileHandle.close() }
 
-        // Streaming download
-        let (inputStream, response) = try await session.bytes(for: request)
+        // Use traditional data method for cross-platform compatibility
+        let (data, response) = try await session.data(for: request)
         guard let httpResp = response as? HTTPURLResponse, (httpResp.statusCode == 206 || httpResp.statusCode == 200) else {
             throw DownloadError.connectionFailed(underlying: NSError(domain: "Segment status not 200/206", code: 0))
         }
 
-        var bytesThisSegment: Int64 = 0
+        let bytesThisSegment = Int64(data.count)
 
-        for try await chunk in inputStream {
-            let data = Data([chunk])
-            guard !data.isEmpty else { break }
-            try fileHandle.write(contentsOf: data)
-            bytesThisSegment += Int64(data.count)
-            if let limiter = limiter {
-                await limiter.throttle(wrote: data.count)
-            }
-            await aggregator.reportSegmentProgress(segmentIndex: segment.index, additionalBytes: Int64(data.count))
+        // Write all data at once
+        guard !data.isEmpty else { return }
+        try fileHandle.write(contentsOf: data)
+        if let limiter = limiter {
+            await limiter.throttle(wrote: data.count)
         }
+        await aggregator.reportSegmentProgress(segmentIndex: segment.index, additionalBytes: bytesThisSegment)
     }
 
     private func assembleParts(segmentRanges: [SegmentRange], tmpDir: URL, outputURL: URL) throws {

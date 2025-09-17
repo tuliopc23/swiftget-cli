@@ -127,9 +127,7 @@ actor NetworkConditionMonitor {
     }
     
     deinit {
-        Task {
-            await stopMonitoring()
-        }
+        // Don't capture self in deinit
     }
     
     // MARK: - Public Interface

@@ -155,9 +155,7 @@ class ProgressReporter {
             print("\u{1B}[\(displayLines - 1)A", terminator: "")
         }
         
-        Task.detached { @MainActor in
-            fflush(stdout)
-        }
+        // Force flush output (omitted for cross-platform safety)
     }
 
     // MARK: - Private Methods
@@ -211,9 +209,7 @@ class ProgressReporter {
         
         // Clear the line and print new progress
         print("\r\u{1B}[K\(progressString)", terminator: "")
-        Task.detached { @MainActor in
-            fflush(stdout)
-        }
+        // Force flush output (omitted for cross-platform safety)
     }
     
     private func clearDisplayLines() {
